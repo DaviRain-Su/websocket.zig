@@ -5,6 +5,10 @@ const ascii = std.ascii;
 const Allocator = std.mem.Allocator;
 const websocket = @import("../websocket.zig");
 
+fn sleepNs(ns: u64) void {
+    std.Io.sleep(std.Io.Threaded.global_single_threaded.ioBasic(), std.Io.Duration.fromNanoseconds(@as(i96, ns)), .awake) catch {};
+}
+
 const M = @This();
 
 const SpecialHeader = enum {
@@ -648,7 +652,7 @@ fn testPool(p: *Pool) void {
         var hs = p.acquire() catch unreachable;
         std.debug.assert(hs.buf[0] == 0);
         hs.buf[0] = 255;
-        std.Thread.sleep(random.uintAtMost(u32, 100000));
+        sleepNs(random.uintAtMost(u32, 100000));
         hs.buf[0] = 0;
         p.release(hs);
     }

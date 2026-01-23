@@ -134,7 +134,7 @@ pub fn main() !void {
     Printer.fmt("\n", .{});
     try slowest.display();
     Printer.fmt("\n", .{});
-    std.posix.exit(if (fail == 0) 0 else 1);
+    std.process.exit(if (fail == 0) 0 else 1);
 }
 
 const Printer = struct {
@@ -255,14 +255,14 @@ const Env = struct {
     }
 
     fn readEnv(allocator: Allocator, key: []const u8) ?[]const u8 {
-        const v = std.process.getEnvVarOwned(allocator, key) catch |err| {
-            if (err == error.EnvironmentVariableNotFound) {
-                return null;
-            }
-            std.log.warn("failed to get env var {s} due to err {}", .{ key, err });
-            return null;
-        };
-        return v;
+        var buf: [256]u8 = undefined;
+        if (key.len + 1 > buf.len) return null;
+        @memcpy(buf[0..key.len], key);
+        buf[key.len] = 0;
+        const name_ptr: [*:0]const u8 = @ptrCast(&buf);
+        const raw = std.c.getenv(name_ptr) orelse return null;
+        const value = std.mem.sliceTo(raw, 0);
+        return allocator.dupe(u8, value) catch null;
     }
 
     fn readEnvBool(allocator: Allocator, key: []const u8, deflt: bool) bool {

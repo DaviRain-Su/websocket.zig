@@ -3,11 +3,40 @@ const builtin = @import("builtin");
 const proto = @import("../proto.zig");
 const buffer = @import("../buffer.zig");
 
-const net = std.net;
+const net = @import("../compat/net.zig");
 const posix = std.posix;
+const linux = std.os.linux;
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
 const FixedBufferAllocator = std.heap.FixedBufferAllocator;
+
+const SocketError = error{SocketFailure};
+fn sysSocket(domain: u32, sock_type: u32, protocol: u32) SocketError!posix.socket_t {
+    const r: posix.system.fd_t = posix.system.socket(@intCast(domain), @intCast(sock_type), @intCast(protocol));
+    if (@as(isize, r) < 0) return error.SocketFailure;
+    return @intCast(r);
+}
+
+fn sysBind(fd: posix.socket_t, addr: *const posix.sockaddr, len: posix.socklen_t) SocketError!void {
+    const rc = posix.system.bind(fd, addr, len);
+    if (@as(isize, rc) < 0) return error.SocketFailure;
+}
+
+fn sysListen(fd: posix.socket_t, backlog: i32) SocketError!void {
+    const rc = posix.system.listen(fd, @as(u32, @intCast(backlog)));
+    if (@as(isize, rc) < 0) return error.SocketFailure;
+}
+
+fn sysPipe2(flags: posix.system.O) SocketError![2]posix.fd_t {
+    var fds: [2]posix.fd_t = undefined;
+    const rc = posix.system.pipe2(&fds, flags);
+    if (@as(isize, rc) < 0) return error.SocketFailure;
+    return fds;
+}
+
+fn sleepNs(ns: u64) void {
+    std.Io.sleep(std.Io.Threaded.global_single_threaded.ioBasic(), std.Io.Duration.fromNanoseconds(@as(i96, ns)), .awake) catch {};
+}
 
 const log = std.log.scoped(.websocket);
 
@@ -159,12 +188,18 @@ pub fn Server(comptime H: type) type {
             var no_delay = true;
             const address = blk: {
                 if (config.unix_path) |unix_path| {
-                    if (comptime std.net.has_unix_sockets == false) {
+                    if (comptime net.has_unix_sockets == false) {
                         return error.UnixPathNotSupported;
                     }
                     no_delay = false;
-                    std.fs.deleteFileAbsolute(unix_path) catch {};
-                    break :blk try net.Address.initUnix(unix_path);
+                    // best-effort unlink existing unix socket path
+                    var tmp: [256]u8 = undefined;
+                    if (unix_path.len < tmp.len) {
+                        @memcpy(tmp[0..unix_path.len], unix_path);
+                        tmp[unix_path.len] = 0;
+                        _ = posix.system.unlink(@ptrCast(&tmp));
+                    }
+                    break :blk try net.initUnix(unix_path);
                 } else {
                     const listen_port = config.port;
                     const listen_address = config.address;
@@ -177,7 +212,7 @@ pub fn Server(comptime H: type) type {
                 if (blockingMode() == false) sock_flags |= posix.SOCK.NONBLOCK;
 
                 const socket_proto = if (address.any.family == posix.AF.UNIX) @as(u32, 0) else posix.IPPROTO.TCP;
-                break :blk try posix.socket(address.any.family, sock_flags, socket_proto);
+                break :blk try sysSocket(address.any.family, sock_flags, socket_proto);
             };
 
             if (no_delay) {
@@ -199,8 +234,8 @@ pub fn Server(comptime H: type) type {
 
             {
                 const socklen = address.getOsSockLen();
-                try posix.bind(socket, &address.any, socklen);
-                try posix.listen(socket, 1024); // kernel backlog
+                try sysBind(socket, &address.any, socklen);
+                try sysListen(socket, 1024); // kernel backlog
             }
 
             const C = @TypeOf(ctx);
@@ -247,7 +282,7 @@ pub fn Server(comptime H: type) type {
                 }
 
                 for (0..worker_count) |i| {
-                    const pipe = try posix.pipe2(.{ .NONBLOCK = true });
+                    const pipe = try sysPipe2(.{ .NONBLOCK = true });
                     errdefer posix.close(pipe[1]);
 
                     workers[i] = try W.init(self.allocator, &self._state, ctx);
@@ -280,7 +315,7 @@ pub fn Server(comptime H: type) type {
                     // necessary to unblock accept on linux
                     // (which might not be that necessary since, on Linux,
                     // NonBlocking should be used)
-                    posix.shutdown(s, .recv) catch {};
+                    _ = posix.system.shutdown(s, posix.SHUT.RD);
                 }
                 posix.close(s);
             }
@@ -342,13 +377,14 @@ pub fn Blocking(comptime H: type) type {
             while (true) {
                 var address: net.Address = undefined;
                 var address_len: posix.socklen_t = @sizeOf(net.Address);
-                const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
-                    if (err == error.ConnectionAborted or err == error.SocketNotListening) {
+                const socket = blk: {
+                    const rc_bits = linux.accept4(listener, &address.any, &address_len, posix.SOCK.CLOEXEC);
+                    const rc_signed: isize = @bitCast(rc_bits);
+                    if (rc_signed < 0) {
                         log.info("received shutdown signal", .{});
                         return;
                     }
-                    log.err("failed to accept socket: {}", .{err});
-                    continue;
+                    break :blk @as(posix.socket_t, @intCast(rc_signed));
                 };
                 log.debug("({f}) connected", .{address});
 
@@ -438,13 +474,13 @@ pub fn Blocking(comptime H: type) type {
                 if (conn_manager.count() == 0) {
                     return;
                 }
-                std.Thread.sleep(std.time.ns_per_ms * 100);
+                sleepNs(std.time.ns_per_ms * 100);
             }
         }
 
         // called for each hc when shutting down
         fn shutdownCleanup(_: *Self, hc: *HandlerConn(H)) void {
-            posix.shutdown(hc.socket, .recv) catch {};
+            _ = posix.system.shutdown(hc.socket, posix.SHUT.RD);
         }
     };
 }
@@ -528,7 +564,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 
                 var it = self.loop.wait(timeout) catch |err| {
                     log.err("failed to wait on events: {}", .{err});
-                    std.Thread.sleep(std.time.ns_per_s);
+                    sleepNs(std.time.ns_per_s);
                     continue;
                 };
 
@@ -538,7 +574,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                     if (data == 0) {
                         self.accept(listener, now) catch |err| {
                             log.err("accept error: {}", .{err});
-                            std.Thread.sleep(std.time.ns_per_ms);
+                            sleepNs(std.time.ns_per_ms);
                         };
                         continue;
                     }
@@ -607,11 +643,11 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                 var address: net.Address = undefined;
                 var address_len: posix.socklen_t = @sizeOf(net.Address);
 
-                const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
-                    // When available, we use SO_REUSEPORT_LB or SO_REUSEPORT, so WouldBlock
-                    // should not be possible in those cases, but if it isn't available
-                    // this error should be ignored as it means another thread picked it up.
-                    return if (err == error.WouldBlock) {} else err;
+                const socket = blk: {
+                    const rc_bits = linux.accept4(listener, &address.any, &address_len, posix.SOCK.CLOEXEC);
+                    const rc_signed: isize = @bitCast(rc_bits);
+                    if (rc_signed < 0) return;
+                    break :blk @as(posix.socket_t, @intCast(rc_signed));
                 };
 
                 log.debug("({f}) connected", .{address});
@@ -911,13 +947,12 @@ const EPoll = struct {
     q: i32,
     event_list: [64]EpollEvent,
 
-    const linux = std.os.linux;
     const EpollEvent = linux.epoll_event;
 
     fn init() !EPoll {
         return .{
             .event_list = undefined,
-            .q = try posix.epoll_create1(0),
+            .q = @intCast(linux.epoll_create1(0)),
         };
     }
 
@@ -927,18 +962,21 @@ const EPoll = struct {
 
     fn monitorAccept(self: *EPoll, fd: c_int) !void {
         var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .ptr = 0 } };
-        return std.posix.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event);
+        const rc: isize = @bitCast(linux.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event));
+        if (rc < 0) return error.SocketFailure;
     }
 
     fn monitorSignal(self: *EPoll, fd: c_int) !void {
         var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .ptr = 1 } };
-        return std.posix.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event);
+        const rc: isize = @bitCast(linux.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event));
+        if (rc < 0) return error.SocketFailure;
     }
 
     fn monitorRead(self: *EPoll, hc: anytype, comptime rearm: bool) !void {
         const op = if (rearm) linux.EPOLL.CTL_MOD else linux.EPOLL.CTL_ADD;
         var event = linux.epoll_event{ .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT, .data = .{ .ptr = @intFromPtr(hc) } };
-        return posix.epoll_ctl(self.q, op, hc.socket, &event);
+        const rc: isize = @bitCast(linux.epoll_ctl(self.q, op, hc.socket, &event));
+        if (rc < 0) return error.SocketFailure;
     }
 
     fn wait(self: *EPoll, timeout_sec: ?i32) !Iterator {
@@ -953,7 +991,7 @@ const EPoll = struct {
             }
         }
 
-        const event_count = posix.epoll_wait(self.q, event_list, timeout);
+        const event_count = linux.epoll_wait(self.q, event_list.ptr, @intCast(event_list.len), timeout);
         return .{
             .index = 0,
             .events = event_list[0..event_count],
@@ -1111,10 +1149,10 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
         const Self = @This();
 
         pub fn init(allocator: Allocator, compression: ?Compression) !Self {
-            var pool = std.heap.MemoryPool(HandlerConn(H)).init(allocator);
-            errdefer pool.deinit();
+            var pool = try std.heap.MemoryPool(HandlerConn(H)).initCapacity(allocator, 0);
+            errdefer pool.deinit(allocator);
 
-            var compression_pool = std.heap.MemoryPool(Conn.Compression).init(allocator);
+            var compression_pool = try std.heap.MemoryPool(Conn.Compression).initCapacity(allocator, 0);
             errdefer compression_pool.deinit();
 
             return .{
@@ -1129,8 +1167,8 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
         }
 
         pub fn deinit(self: *Self) void {
-            self.pool.deinit();
-            self.compression_pool.deinit();
+            self.pool.deinit(self.allocator);
+            self.compression_pool.deinit(self.allocator);
         }
 
         pub fn count(self: *Self) usize {
@@ -1148,7 +1186,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
             self.lock.lock();
             defer self.lock.unlock();
 
-            const hc = try self.pool.create();
+            const hc = try self.pool.create(self.allocator);
             hc.* = .{
                 .state = if (MANAGE_HS) .handshake else .active,
                 .socket = socket,
@@ -1160,7 +1198,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                     ._closed = false,
                     .started = now,
                     .address = address,
-                    .stream = .{ .handle = socket },
+                    .stream = net.streamFromHandle(socket),
                     .compression = null,
                 },
             };
@@ -1250,7 +1288,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                 return;
             }
 
-            const compression = try self.compression_pool.create();
+            const compression = try self.compression_pool.create(self.allocator);
             errdefer self.compression_pool.destroy(compression);
 
             compression.* = .{
@@ -1432,7 +1470,10 @@ pub const Conn = struct {
 
         var i: usize = 0;
         while (true) {
-            var n = try std.posix.writev(socket, vec[i..]);
+            const n_bits = linux.writev(socket, vec.ptr + i, vec.len - i);
+            const n_signed: isize = @bitCast(n_bits);
+            if (n_signed < 0) return error.SocketClosed;
+            var n: usize = @intCast(n_signed);
             while (n >= vec[i].len) {
                 n -= vec[i].len;
                 i += 1;
@@ -1589,8 +1630,7 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
     var reader = &hc.reader.?;
     reader.fill(conn.stream) catch |err| {
         switch (err) {
-            error.BrokenPipe, error.Closed, error.ConnectionResetByPeer => log.debug("({f}) connection closed: {}", .{ conn.address, err }),
-            else => log.warn("({f}) error reading from connection: {}", .{ conn.address, err }),
+            error.Closed, error.ConnectionResetByPeer => log.debug("({f}) connection closed: {}", .{ conn.address, err }),
         }
         return false;
     };
@@ -1766,12 +1806,11 @@ fn preHandOffWrite(conn: *Conn, response: []const u8) void {
 
     var pos: usize = 0;
     while (pos < response.len) {
-        const n = posix.write(socket, response[pos..]) catch return;
-        if (n == 0) {
-            // closed
-            return;
-        }
-        pos += n;
+        const chunk = response[pos..];
+        const n_bits = posix.system.write(socket, chunk.ptr, chunk.len);
+        const n: isize = @bitCast(n_bits);
+        if (n <= 0) return;
+        pos += @intCast(n);
     }
 }
 
@@ -1842,7 +1881,7 @@ test "tests:afterAll" {
     test_server.stop();
     test_thread.join();
     test_server.deinit();
-    try t.expectEqual(false, global_test_allocator.detectLeaks());
+    try t.expectEqual(@as(usize, 0), global_test_allocator.detectLeaks());
 }
 
 test "Server: invalid handshake" {
@@ -1940,8 +1979,8 @@ test "Conn: close" {
 
 fn testStream(handshake: bool) !net.Stream {
     const timeout = std.mem.toBytes(std.posix.timeval{ .sec = 0, .usec = 20_000 });
-    const address = try std.net.Address.parseIp("127.0.0.1", 9292);
-    const stream = try std.net.tcpConnectToAddress(address);
+    const address = try net.Address.parseIp("127.0.0.1", 9292);
+    const stream = try net.tcpConnectToAddress(address);
     try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout);
     try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, &timeout);
 

@@ -3,6 +3,10 @@ const std = @import("std");
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
 
+fn sleepNs(ns: u64) void {
+    std.Io.sleep(std.Io.Threaded.global_single_threaded.ioBasic(), std.Io.Duration.fromNanoseconds(@as(i96, ns)), .awake) catch {};
+}
+
 pub const Opts = struct {
     count: u16,
     backlog: u32,
@@ -188,7 +192,7 @@ test "ThreadPool: small fuzz" {
         tp.spawn(.{1});
     }
     while (tp.empty() == false) {
-        std.Thread.sleep(std.time.ns_per_ms);
+        sleepNs(std.time.ns_per_ms);
     }
     tp.deinit();
     try t.expectEqual(50_000, testSum);
@@ -202,7 +206,7 @@ test "ThreadPool: large fuzz" {
         tp.spawn(.{1});
     }
     while (tp.empty() == false) {
-        std.Thread.sleep(std.time.ns_per_ms);
+        sleepNs(std.time.ns_per_ms);
     }
     tp.deinit();
     try t.expectEqual(50_000, testSum);
@@ -213,5 +217,5 @@ fn testIncr(c: u64, buf: []u8) void {
     std.debug.assert(buf.len == 512);
     _ = @atomicRmw(u64, &testSum, .Add, c, .monotonic);
     // let the threadpool queue get backed up
-    std.Thread.sleep(std.time.ns_per_us * 100);
+    sleepNs(std.time.ns_per_us * 100);
 }

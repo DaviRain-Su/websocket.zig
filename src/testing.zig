@@ -1,6 +1,7 @@
 const std = @import("std");
 const t = @import("t.zig");
 const ws = @import("websocket.zig");
+const net = @import("compat/net.zig");
 
 pub fn init() Testing {
     return Testing.init();
@@ -53,7 +54,7 @@ pub const Testing = struct {
                 ._closed = false,
                 .started = 0,
                 .stream = pair.server,
-                .address = std.net.Address.parseIp("127.0.0.1", port) catch unreachable,
+                .address = net.Address.parseIp("127.0.0.1", port) catch unreachable,
             },
             .reader = reader,
             .received = std.ArrayList(ws.Message).init(aa),

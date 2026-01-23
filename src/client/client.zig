@@ -2,7 +2,7 @@ const std = @import("std");
 const proto = @import("../proto.zig");
 const buffer = @import("../buffer.zig");
 
-const net = std.net;
+const net = @import("../compat/net.zig");
 const posix = std.posix;
 const tls = std.crypto.tls;
 
@@ -207,8 +207,7 @@ pub const Client = struct {
                 return err;
             } orelse {
                 reader.fill(stream) catch |err| switch (err) {
-                    error.WouldBlock => return null,
-                    error.Closed, error.ConnectionResetByPeer, error.BrokenPipe, error.NotOpenForReading => {
+                    error.Closed, error.ConnectionResetByPeer => {
                         @atomicStore(bool, &self._closed, true, .monotonic);
                         return error.Closed;
                     },
@@ -426,7 +425,9 @@ const TLSClient = struct {
 
         const bundle = config.ca_bundle orelse blk: {
             var b = Bundle{};
-            try b.rescan(aa);
+            const io = std.Io.Threaded.global_single_threaded.ioBasic();
+            const now = try std.Io.Clock.now(.real, io);
+            try b.rescan(aa, io, now);
             break :blk b;
         };
 
@@ -448,14 +449,21 @@ const TLSClient = struct {
             .stream_reader = stream.reader(buf.ptr[buf_len .. 2 * buf_len][0..buf_len]),
         };
 
+        const io = std.Io.Threaded.global_single_threaded.ioBasic();
+        var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+        std.Io.randomSecure(io, &entropy) catch unreachable;
+        const now_ts = try std.Io.Clock.now(.real, io);
+
         self.client = try tls.Client.init(
-            self.stream_reader.interface(),
+            &self.stream_reader.interface,
             &self.stream_writer.interface,
             .{
                 .ca = .{ .bundle = bundle },
                 .host = .{ .explicit = config.host },
                 .read_buffer = buf.ptr[2 * buf_len .. 3 * buf_len][0..buf_len],
                 .write_buffer = buf.ptr[3 * buf_len .. 4 * buf_len][0..buf_len],
+                .entropy = &entropy,
+                .realtime_now_seconds = @intCast(@divTrunc(now_ts.nanoseconds, std.time.ns_per_s)),
             },
         );
 
@@ -468,18 +476,22 @@ const TLSClient = struct {
     }
 };
 
+fn randomFill(buf: []u8) void {
+    std.Io.randomSecure(std.Io.Threaded.global_single_threaded.ioBasic(), buf) catch unreachable;
+}
+
 fn generateKey() [16]u8 {
     if (comptime @import("builtin").is_test) {
         return [16]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
     }
     var key: [16]u8 = undefined;
-    std.crypto.random.bytes(&key);
+    randomFill(&key);
     return key;
 }
 
 fn generateMask() [4]u8 {
     var m: [4]u8 = undefined;
-    std.crypto.random.bytes(&m);
+    randomFill(&m);
     return m;
 }
 
@@ -530,7 +542,7 @@ fn readHandshakeReply(buf: []u8, key: []const u8, opts: *const Client.HandshakeO
     const ascii = std.ascii;
 
     const timeout_ms = opts.timeout_ms;
-    const deadline = std.time.milliTimestamp() + timeout_ms;
+    var timer = try std.time.Timer.start();
     try stream.readTimeout(timeout_ms);
 
     var pos: usize = 0;
@@ -538,9 +550,8 @@ fn readHandshakeReply(buf: []u8, key: []const u8, opts: *const Client.HandshakeO
     var complete_response: u8 = 0;
 
     while (true) {
-        const n = stream.read(buf[pos..]) catch |err| switch (err) {
-            error.WouldBlock => return error.Timeout,
-            else => return err,
+        const n = stream.read(buf[pos..]) catch |err| {
+            return err;
         };
         if (n == 0) {
             return error.ConnectionClosed;
@@ -619,7 +630,7 @@ fn readHandshakeReply(buf: []u8, key: []const u8, opts: *const Client.HandshakeO
             }
         }
 
-        if (std.time.milliTimestamp() > deadline) {
+        if (timer.read() > @as(u64, timeout_ms) * std.time.ns_per_ms) {
             return error.Timeout;
         }
 

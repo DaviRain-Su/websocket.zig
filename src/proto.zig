@@ -725,12 +725,10 @@ test "Reader: fuzz" {
 
         i = 0;
         while (true) {
-            reader.fill(&writer) catch |err| switch (err) {
-                error.Closed => {
-                    try t.expectEqual(@as(u32, @intCast(i)), MESSAGE_TO_SEND);
-                    break;
-                },
-                else => return err,
+            reader.fill(&writer) catch |err| {
+                try t.expectEqual(error.Closed, err);
+                try t.expectEqual(@as(u32, @intCast(i)), MESSAGE_TO_SEND);
+                break;
             };
 
             while (true) {
