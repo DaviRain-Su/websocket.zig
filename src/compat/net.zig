@@ -6,9 +6,8 @@ const ionet = std.Io.net;
 pub const has_unix_sockets = ionet.has_unix_sockets;
 
 fn defaultIo() Io {
-    // Use the global single-threaded IO implementation. This keeps things
-    // simple and avoids pulling in the concurrent runtime for now.
-    return Io.Threaded.global_single_threaded.ioBasic();
+    // Use the global single-threaded IO implementation with networking enabled.
+    return Io.Threaded.global_single_threaded.io();
 }
 
 pub const Address = extern union {
@@ -63,29 +62,99 @@ pub const Stream = struct {
     io: Io,
     handle: ionet.Socket.Handle,
 
-    pub const Reader = ionet.Stream.Reader;
-    pub const Writer = ionet.Stream.Writer;
+    pub const Reader = struct {
+        interface: Io.Reader,
+        stream: Stream,
+        err: ?Error = null,
+
+        pub const Error = error{Timeout, ConnectionResetByPeer};
+
+        pub fn init(stream: Stream, buffer: []u8) Reader {
+            return .{
+                .interface = .{
+                    .vtable = &.{ .stream = streamImpl },
+                    .buffer = buffer,
+                    .seek = 0,
+                    .end = 0,
+                },
+                .stream = stream,
+                .err = null,
+            };
+        }
+
+        fn streamImpl(io_r: *Io.Reader, io_w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+            const r: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
+            const dest = limit.slice(try io_w.writableSliceGreedy(1));
+            const n = posix.read(r.stream.handle, dest) catch |err| {
+                r.err = mapReadError(err);
+                return error.ReadFailed;
+            };
+            if (n == 0) return error.EndOfStream;
+            io_w.advance(n);
+            return n;
+        }
+    };
+
+    pub const Writer = struct {
+        interface: Io.Writer,
+        stream: Stream,
+        err: ?Error = null,
+
+        pub const Error = error{Timeout, ConnectionResetByPeer};
+
+        pub fn init(stream: Stream, buffer: []u8) Writer {
+            return .{
+                .interface = .{
+                    .vtable = &.{ .drain = drain, .sendFile = sendFile },
+                    .buffer = buffer,
+                },
+                .stream = stream,
+                .err = null,
+            };
+        }
+
+        fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+            const w: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
+            const buffered = io_w.buffered();
+            var total_len: usize = buffered.len;
+
+            for (data) |chunk| {
+                total_len += chunk.len * splat;
+            }
+
+            writeAllPosix(w.stream.handle, buffered) catch |err| {
+                w.err = err;
+                return error.WriteFailed;
+            };
+
+            for (data) |chunk| {
+                var repeat: usize = 0;
+                while (repeat < splat) : (repeat += 1) {
+                    writeAllPosix(w.stream.handle, chunk) catch |err| {
+                        w.err = err;
+                        return error.WriteFailed;
+                    };
+                }
+            }
+
+            return io_w.consume(total_len);
+        }
+
+        fn sendFile(io_w: *Io.Writer, file_reader: *Io.File.Reader, limit: Io.Limit) Io.Writer.FileError!usize {
+            return Io.Writer.unimplementedSendFile(io_w, file_reader, limit);
+        }
+    };
 
     pub fn read(self: *const Stream, buf: []u8) !usize {
-        const rc = posix.system.read(self.handle, buf.ptr, buf.len);
-        const n: isize = @bitCast(rc);
-        if (n < 0) return error.ConnectionResetByPeer;
-        if (n == 0) return 0;
-        return @intCast(n);
+        return readPosix(self.handle, buf);
     }
 
     pub fn writeAll(self: *const Stream, data: []const u8) !void {
-        var remaining = data;
-        while (remaining.len > 0) {
-            const rc = posix.system.write(self.handle, remaining.ptr, remaining.len);
-            const n: isize = @bitCast(rc);
-            if (n <= 0) return error.ConnectionResetByPeer;
-            remaining = remaining[@intCast(n)..];
-        }
+        try writeAllPosix(self.handle, data);
     }
 
     pub fn reader(self: *const Stream, buffer: []u8) Reader {
-        return Reader.init(self.inner, self.io, buffer);
+        return Reader.init(self.*, buffer);
     }
 
     pub fn readAtLeast(self: *const Stream, buf: []u8, at_least: usize) !usize {
@@ -99,11 +168,55 @@ pub const Stream = struct {
     }
 
     pub fn writer(self: *const Stream, buffer: []u8) Writer {
-        return Writer.init(self.inner, self.io, buffer);
+        return Writer.init(self.*, buffer);
     }
 
     pub fn close(self: *const Stream) void {
         _ = posix.system.close(self.handle);
+    }
+
+    fn mapReadError(err: anyerror) Reader.Error {
+        return switch (err) {
+            error.WouldBlock => error.Timeout,
+            error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+            else => error.ConnectionResetByPeer,
+        };
+    }
+
+    fn mapWriteError(err: anyerror) Writer.Error {
+        return switch (err) {
+            error.WouldBlock => error.Timeout,
+            error.ConnectionResetByPeer, error.BrokenPipe => error.ConnectionResetByPeer,
+            else => error.ConnectionResetByPeer,
+        };
+    }
+
+    fn readPosix(handle: posix.fd_t, buf: []u8) Reader.Error!usize {
+        return posix.read(handle, buf) catch |err| {
+            return mapReadError(err);
+        };
+    }
+
+    fn writePosix(handle: posix.fd_t, data: []const u8) Writer.Error!usize {
+        if (data.len == 0) return 0;
+        while (true) {
+            const rc = posix.system.write(handle, data.ptr, data.len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return @intCast(rc),
+                .INTR => continue,
+                .AGAIN => return error.Timeout,
+                .PIPE, .CONNRESET => return error.ConnectionResetByPeer,
+                else => return error.ConnectionResetByPeer,
+            }
+        }
+    }
+
+    fn writeAllPosix(handle: posix.fd_t, data: []const u8) Writer.Error!void {
+        var remaining = data;
+        while (remaining.len > 0) {
+            const n = try writePosix(handle, remaining);
+            remaining = remaining[n..];
+        }
     }
 };
 

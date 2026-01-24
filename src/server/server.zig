@@ -1630,7 +1630,7 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
     var reader = &hc.reader.?;
     reader.fill(conn.stream) catch |err| {
         switch (err) {
-            error.Closed, error.ConnectionResetByPeer => log.debug("({f}) connection closed: {}", .{ conn.address, err }),
+            error.Closed, error.ConnectionResetByPeer, error.Timeout => log.debug("({f}) connection closed: {}", .{ conn.address, err }),
         }
         return false;
     };
@@ -1816,7 +1816,11 @@ fn preHandOffWrite(conn: *Conn, response: []const u8) void {
 
 fn timestamp() u32 {
     if (comptime @hasDecl(posix, "CLOCK") == false or posix.CLOCK == void) {
-        return @intCast(std.time.timestamp());
+        const inst = std.time.Instant.now() catch return 0;
+        if (comptime @TypeOf(inst.timestamp) == std.posix.timespec) {
+            return @intCast(inst.timestamp.sec);
+        }
+        return @intCast(inst.timestamp);
     }
     const ts = posix.clock_gettime(posix.CLOCK.REALTIME) catch unreachable;
     return @intCast(ts.sec);

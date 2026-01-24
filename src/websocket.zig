@@ -9,6 +9,7 @@ pub const MessageType = Message.Type;
 pub const MessageTextType = Message.TextType;
 
 pub const Client = @import("client/client.zig").Client;
+pub const compat = @import("compat/net.zig");
 
 pub const server = @import("server/server.zig");
 pub const testing = @import("testing.zig");
